@@ -272,6 +272,7 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 		tool, _ = sjson.SetBytes(tool, "moderation", v)
 	}
 
+	logImagesGenerationParsed(c, imageModel, responseFormat, stream, tool)
 	responsesReq := buildImagesResponsesRequest(prompt, nil, tool)
 	if stream {
 		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_generation")
@@ -362,7 +363,8 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 
 	var maskDataURL *string
-	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+	maskFiles := form.File["mask"]
+	if len(maskFiles) > 0 && maskFiles[0] != nil {
 		dataURL, err := multipartFileToDataURL(maskFiles[0])
 		if err != nil {
 			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
@@ -415,6 +417,7 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", strings.TrimSpace(*maskDataURL))
 	}
 
+	logImagesEditMultipartParsed(c, imageModel, responseFormat, stream, tool, imageFiles, maskFiles)
 	responsesReq := buildImagesResponsesRequest(prompt, images, tool)
 	if stream {
 		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_edit")
@@ -525,6 +528,11 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", strings.TrimSpace(*maskDataURL))
 	}
 
+	maskCount := 0
+	if maskDataURL != nil {
+		maskCount = 1
+	}
+	logImagesEditJSONParsed(c, imageModel, responseFormat, stream, tool, images, maskCount)
 	responsesReq := buildImagesResponsesRequest(prompt, images, tool)
 	if stream {
 		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_edit")
@@ -580,11 +588,14 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	if mainModel == "" {
 		mainModel = defaultImagesMainModel
 	}
+	observer := newImagesResponsesObserver(c.Request.Context(), c, mainModel, responseFormat, false)
+	observer.logUpstreamStarted(len(responsesReq))
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", mainModel, responsesReq, "")
 
-	out, errMsg := collectImagesFromResponsesStream(cliCtx, dataChan, errChan, responseFormat)
+	out, errMsg := collectImagesFromResponsesStream(cliCtx, dataChan, errChan, responseFormat, observer)
 	stopKeepAlive()
 	if errMsg != nil {
+		observer.logFailure(errMsg)
 		h.WriteErrorResponse(c, errMsg)
 		if errMsg.Error != nil {
 			cliCancel(errMsg.Error)
@@ -598,10 +609,11 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	cliCancel()
 }
 
-func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, errs <-chan *interfaces.ErrorMessage, responseFormat string) ([]byte, *interfaces.ErrorMessage) {
+func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, errs <-chan *interfaces.ErrorMessage, responseFormat string, observer *imagesResponsesObserver) ([]byte, *interfaces.ErrorMessage) {
 	acc := &sseFrameAccumulator{}
 
 	processFrame := func(frame []byte) ([]byte, bool, *interfaces.ErrorMessage) {
+		observer.observeFrame()
 		for _, line := range bytes.Split(frame, []byte("\n")) {
 			trimmed := bytes.TrimSpace(bytes.TrimRight(line, "\r"))
 			if len(trimmed) == 0 {
@@ -617,8 +629,13 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			if !json.Valid(payload) {
 				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("invalid SSE data JSON")}
 			}
+			observer.observeEvent(payload)
 
-			if gjson.GetBytes(payload, "type").String() != "response.completed" {
+			eventType := gjson.GetBytes(payload, "type").String()
+			if eventType == "response.failed" {
+				return nil, false, buildImagesResponseFailedError(payload)
+			}
+			if eventType != "response.completed" {
 				continue
 			}
 
@@ -658,6 +675,7 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 				}
 				return nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("stream disconnected before completion")}
 			}
+			observer.observeChunk(chunk)
 			for _, frame := range acc.AddChunk(chunk) {
 				if out, done, errMsg := processFrame(frame); errMsg != nil {
 					return nil, errMsg
@@ -772,6 +790,8 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	if mainModel == "" {
 		mainModel = defaultImagesMainModel
 	}
+	observer := newImagesResponsesObserver(c.Request.Context(), c, mainModel, responseFormat, true)
+	observer.logUpstreamStarted(len(responsesReq))
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", mainModel, responsesReq, "")
 
 	setSSEHeaders := func() {
@@ -800,6 +820,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 				errChan = nil
 				continue
 			}
+			observer.logFailure(errMsg)
 			h.WriteErrorResponse(c, errMsg)
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
@@ -820,13 +841,13 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
-			h.forwardImagesStream(cliCtx, c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, chunk, responseFormat, streamPrefix, writeEvent)
+			h.forwardImagesStream(cliCtx, c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, chunk, responseFormat, streamPrefix, observer, writeEvent)
 			return
 		}
 	}
 }
 
-func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, firstChunk []byte, responseFormat string, streamPrefix string, writeEvent func(string, []byte)) {
+func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, firstChunk []byte, responseFormat string, streamPrefix string, observer *imagesResponsesObserver, writeEvent func(string, []byte)) {
 	acc := &sseFrameAccumulator{}
 
 	responseFormat = strings.ToLower(strings.TrimSpace(responseFormat))
@@ -838,6 +859,7 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 		if errMsg == nil {
 			return
 		}
+		observer.logFailure(errMsg)
 		status := http.StatusInternalServerError
 		if errMsg.StatusCode > 0 {
 			status = errMsg.StatusCode
@@ -851,6 +873,7 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 	}
 
 	processFrame := func(frame []byte) (done bool) {
+		observer.observeFrame()
 		for _, line := range bytes.Split(frame, []byte("\n")) {
 			trimmed := bytes.TrimSpace(bytes.TrimRight(line, "\r"))
 			if len(trimmed) == 0 || !bytes.HasPrefix(trimmed, []byte("data:")) {
@@ -860,6 +883,7 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
 				continue
 			}
+			observer.observeEvent(payload)
 
 			switch gjson.GetBytes(payload, "type").String() {
 			case "response.image_generation_call.partial_image":
@@ -906,11 +930,19 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 					writeEvent(eventName, data)
 				}
 				return true
+			case "response.failed":
+				errMsg := buildImagesResponseFailedError(payload)
+				if errMsg == nil {
+					errMsg = &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("upstream response.failed")}
+				}
+				emitError(errMsg)
+				return true
 			}
 		}
 		return false
 	}
 
+	observer.observeChunk(firstChunk)
 	for _, frame := range acc.AddChunk(firstChunk) {
 		if processFrame(frame) {
 			cancel(nil)
@@ -941,6 +973,7 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 				cancel(nil)
 				return
 			}
+			observer.observeChunk(chunk)
 			for _, frame := range acc.AddChunk(chunk) {
 				if processFrame(frame) {
 					cancel(nil)
